@@ -6,3 +6,8 @@ ignore/
 checkpoints/
 .history/
 envs/
+**/__pycache__
+**/*.pkl
+**/*.faiss
+math_search/e5_large
+math_search/aimo
