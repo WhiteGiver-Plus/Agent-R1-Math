@@ -5,7 +5,88 @@ from tqdm import tqdm
 from typing import List, Tuple, Dict, Any
 import random
 from datasets import load_dataset
-from retrieval import encode_query, initialize_resources, GLOBAL_TEXTS, GLOBAL_INDEX
+import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModel
+from torch import Tensor
+
+# Global variables to store loaded resources
+INDEX = None
+TEXTS = None
+MODEL = None
+TOKENIZER = None
+DEVICE = None
+
+def average_pool(last_hidden_states: Tensor,
+                 attention_mask: Tensor) -> Tensor:
+    last_hidden = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
+    return last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
+
+def load_resources(device='cuda'):
+    """加载FAISS索引、文本数据和模型"""
+    print("加载FAISS索引...")
+    try:
+        index = faiss.read_index("olympiads_solution_index.faiss")
+    except RuntimeError:
+        print("未找到FAISS索引文件，请先运行create_index.py")
+        return None, None, None, None
+    
+    print("加载文本数据...")
+    try:
+        with open('olympiads_solution_texts.pkl', 'rb') as f:
+            texts = pickle.load(f)
+    except FileNotFoundError:
+        print("未找到文本数据文件，请先运行create_index.py")
+        return index, None, None, None
+    
+    print("加载模型和分词器...")
+    tokenizer = AutoTokenizer.from_pretrained('e5_large')
+    model = AutoModel.from_pretrained('e5_large')
+    
+    # 检查设备可用性
+    if device == 'cuda' and not torch.cuda.is_available():
+        print("CUDA不可用，使用CPU")
+        device = 'cpu'
+    
+    device = torch.device(device)
+    model = model.to(device)
+    
+    return index, texts, model, tokenizer
+
+def initialize_resources(device='cuda'):
+    """初始化全局资源"""
+    global INDEX, TEXTS, MODEL, TOKENIZER, DEVICE
+    INDEX, TEXTS, MODEL, TOKENIZER = load_resources(device)
+    DEVICE = torch.device(device if (device == 'cuda' and torch.cuda.is_available()) else 'cpu')
+    return INDEX is not None and TEXTS is not None and MODEL is not None and TOKENIZER is not None
+
+def get_detailed_instruct(task_description: str, query: str) -> str:
+    """为查询添加任务指令"""
+    return f'Instruct: {task_description}\nQuery: {query}'
+
+def encode_query(queries: List[str]):
+    """使用与训练相同的模型编码查询(支持批量)"""
+    global MODEL, TOKENIZER, DEVICE
+    
+    # 处理查询 - 添加指令格式
+    task_description = "Given a math search query, retrieve relevant math proof relevant to the query"
+    input_texts = [get_detailed_instruct(task_description, query) for query in queries]
+    
+    # 分词和编码
+    inputs = TOKENIZER(input_texts, max_length=512, padding=True, 
+                       truncation=True, return_tensors='pt')
+    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+    
+    # 获取嵌入
+    with torch.no_grad():
+        outputs = MODEL(**inputs)
+    
+    # 池化和归一化
+    query_embeddings = average_pool(outputs.last_hidden_state, inputs['attention_mask'])
+    query_embeddings = F.normalize(query_embeddings, p=2, dim=1)
+    
+    # 转换为numpy数组
+    return query_embeddings.cpu().numpy().astype(np.float32)
 
 def remove_duplicates_from_external(external_dataset_name, prompt_key='prompt', 
                                    similarity_threshold=0.9, top_k=6, 
@@ -29,6 +110,11 @@ def remove_duplicates_from_external(external_dataset_name, prompt_key='prompt',
         print("初始化资源失败，退出")
         return None, None
     
+    # 确保全局索引已正确初始化
+    if INDEX is None:
+        print("错误: 全局索引未能正确初始化")
+        return None, None
+    
     # 加载嵌入
     print("加载嵌入数据...")
     try:
@@ -41,7 +127,7 @@ def remove_duplicates_from_external(external_dataset_name, prompt_key='prompt',
         return None, None
     
     # 加载GAIA数据集
-    print(f"从HuggingFace加载外部数据集: {external_dataset_name}...")
+    print(f"加载数据集: {external_dataset_name}...")
     try:
         external_dataset = load_dataset(external_dataset_name)
         # 通常使用'train'分割，但根据实际情况可能需要调整
@@ -81,8 +167,17 @@ def remove_duplicates_from_external(external_dataset_name, prompt_key='prompt',
         # 批量编码查询
         query_embeddings = encode_query(queries)
         
+        # 确保查询嵌入不为空
+        if query_embeddings is None or len(query_embeddings) == 0:
+            print(f"警告: 批次 {i//batch_size + 1} 的查询嵌入为空，跳过此批次")
+            continue
+            
         # 批量搜索相似条目
-        scores, indices = GLOBAL_INDEX.search(query_embeddings, top_k)
+        try:
+            scores, indices = INDEX.search(query_embeddings, top_k)
+        except Exception as e:
+            print(f"搜索过程中出错: {e}")
+            return None, None
         
         # 处理每个查询的结果
         for j in range(len(batch_prompts)):
@@ -145,7 +240,7 @@ def main():
     """去重主函数"""
     print("开始执行数据去重...")
     # 请替换为实际的GAIA数据集名称，例如 "OpenLemur/gaia"
-    external_dataset_name = "GAIR/LIMR"
+    external_dataset_name = "LIMR"
     
     # 根据实际的数据集结构调整prompt_key参数
     filtered_texts, filtered_embeddings = remove_duplicates_from_external(
